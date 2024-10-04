@@ -14,6 +14,7 @@ use std::{fs, net::SocketAddr};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Close all proxer processes
     terminate_proxer();
+    println!("Test");
 
     // Read the config file
     let config_file = "proxer.json5";
