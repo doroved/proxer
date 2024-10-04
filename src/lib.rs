@@ -1,8 +1,9 @@
 use base64::{engine::general_purpose::STANDARD as b64, Engine as _};
 use chrono::Local;
 use hyper::{Body, Client, Method, Request, Response, StatusCode};
+use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
-use std::{process::Command, string::FromUtf8Error, sync::Arc, time::Duration};
+use std::{option, process::Command, string::FromUtf8Error, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
@@ -11,6 +12,34 @@ use tokio::{
 use tokio_native_tls::{native_tls, TlsConnector};
 use toml::from_str;
 use wildmatch::WildMatch;
+
+//
+#[derive(Default, Debug, Clone)]
+pub struct DpiBypassOptions {
+    pub tcp_fragmentation: bool,
+    pub keep_alive_fragmentation: bool,
+    pub replace_host_header: bool,
+    pub remove_space_in_host_header: bool,
+    // add_space_in_method: bool,
+    pub mix_host_header_case: bool,
+    pub send_fake_packets: bool,
+}
+
+impl DpiBypassOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn enable_all(&mut self) {
+        self.tcp_fragmentation = true;
+        self.keep_alive_fragmentation = true;
+        self.replace_host_header = true;
+        self.remove_space_in_host_header = true;
+        // self.add_space_in_method = true;
+        self.mix_host_header_case = true;
+        self.send_fake_packets = true;
+    }
+}
 
 // Struct for storing package information
 #[derive(Debug, Deserialize)]
@@ -58,6 +87,7 @@ pub struct Proxy {
 pub async fn handle_request(
     req: Request<Body>,
     config: Arc<Vec<ProxyConfig>>,
+    options: Arc<DpiBypassOptions>,
 ) -> Result<Response<Body>, hyper::Error> {
     let addr = req.uri().authority().unwrap().to_string();
     let time = formatted_time();
@@ -65,9 +95,10 @@ pub async fn handle_request(
     if req.method() == Method::CONNECT {
         if let Some(_) = req.uri().authority().map(|auth| auth.to_string()) {
             let config_clone = Arc::clone(&config);
+            let options_clone = Arc::clone(&options);
 
             tokio::spawn(async move {
-                match tunnel(req, config_clone).await {
+                match tunnel(req, config_clone, options_clone).await {
                     Ok(_) => {}
                     Err(e) => {
                         eprintln!("\x1B[31m\x1B[1m[{time}] {} -> {}\x1B[0m", addr, e);
@@ -120,6 +151,7 @@ pub async fn handle_request(
 async fn tunnel(
     req: Request<Body>,
     config: Arc<Vec<ProxyConfig>>,
+    options: Arc<DpiBypassOptions>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr = req.uri().authority().unwrap().to_string();
     let host = req.uri().host().unwrap();
@@ -175,27 +207,78 @@ async fn tunnel(
             let mut bytes_read = 0;
 
             // Read the first bytes of Client Hello
-            while bytes_read < 5 {
-                // Minimum length of TLS record
+            // while bytes_read < 5 {
+            //     // Minimum length of TLS record
+            //     let n = client_reader.read(&mut buffer[bytes_read..]).await?;
+            //     if n == 0 {
+            //         return Err("Connection closed".into());
+            //     }
+            //     bytes_read += n;
+            // }
+            // Читаем первый пакет данных
+            while bytes_read < buffer.len() {
                 let n = client_reader.read(&mut buffer[bytes_read..]).await?;
                 if n == 0 {
-                    return Err("Connection closed".into());
+                    break;
                 }
                 bytes_read += n;
             }
 
+            let mut modified_buffer = buffer[..bytes_read].to_vec();
+
+            // Применяем методы обхода DPI
+            if options.replace_host_header {
+                replace_host_header(&mut modified_buffer);
+            }
+            if options.remove_space_in_host_header {
+                remove_space_in_host_header(&mut modified_buffer);
+            }
+            // if options.add_space_in_method {
+            //     add_space_in_method(&mut modified_buffer);
+            // }
+            if options.mix_host_header_case {
+                mix_host_header_case(&mut modified_buffer);
+            }
+
+            // TCP-level fragmentation
+            if options.tcp_fragmentation {
+                let first_fragment_size = 1;
+                server
+                    .write_all(&modified_buffer[..first_fragment_size])
+                    .await?;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                server
+                    .write_all(&modified_buffer[first_fragment_size..])
+                    .await?;
+            } else {
+                server.write_all(&modified_buffer).await?;
+            }
+
+            // Отправка фейковых пакетов
+            // if options.send_fake_packets {
+            //     send_fake_packets(&addr).await?;
+            // }
+
             // Send the first byte to the server
-            server.write_all(&buffer[..1]).await?;
+            // server.write_all(&buffer[..1]).await?;
 
             // Send the rest of the bytes to the server
-            server.write_all(&buffer[1..bytes_read]).await?;
+            // server.write_all(&buffer[1..bytes_read]).await?;
 
             // Split the server connection into reader and writer
             let (mut server_reader, mut server_writer) = server.split();
 
             // Copy data from client to server
+            // let client_to_server = async {
+            //     tokio::io::copy(&mut client_reader, &mut server_writer).await?;
+            //     server_writer.shutdown().await
+            // };
             let client_to_server = async {
-                tokio::io::copy(&mut client_reader, &mut server_writer).await?;
+                if options.keep_alive_fragmentation {
+                    handle_keep_alive_fragmentation(&mut client_reader, &mut server_writer).await?;
+                } else {
+                    tokio::io::copy(&mut client_reader, &mut server_writer).await?;
+                }
                 server_writer.shutdown().await
             };
 
@@ -407,4 +490,91 @@ impl Proxy {
 
         String::from_utf8(output.stdout)
     }
+}
+
+///////
+fn replace_host_header(buffer: &mut Vec<u8>) {
+    let host_header = b"Host:";
+    if let Some(pos) = find_subsequence(buffer, host_header) {
+        buffer[pos + 2] = b'S';
+    }
+}
+
+fn remove_space_in_host_header(buffer: &mut Vec<u8>) {
+    let host_header = b"Host: ";
+    if let Some(pos) = find_subsequence(buffer, host_header) {
+        buffer.remove(pos + 4);
+    }
+}
+
+// fn add_space_in_method(buffer: &mut Vec<u8>) {
+//     let methods = vec![b"GET ", b"POST ", b"PUT ", b"DELETE "];
+//     for method in &methods {
+//         if let Some(pos) = find_subsequence(buffer, method) {
+//             buffer.insert(pos + method.len() - 1, b' ');
+//             break;
+//         }
+//     }
+// }
+
+fn mix_host_header_case(buffer: &mut Vec<u8>) {
+    let host_header = b"Host:";
+    if let Some(pos) = find_subsequence(buffer, host_header) {
+        let end = buffer[pos..]
+            .iter()
+            .position(|&x| x == b'\r')
+            .unwrap_or(buffer.len() - pos)
+            + pos;
+        for i in pos + 5..end {
+            if buffer[i].is_ascii_alphabetic() {
+                buffer[i] ^= 0x20;
+            }
+        }
+    }
+}
+
+async fn handle_keep_alive_fragmentation<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<(), std::io::Error>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let mut buffer = vec![0u8; 4096];
+    loop {
+        let n = reader.read(&mut buffer).await?;
+        if n == 0 {
+            break;
+        }
+
+        let first_fragment_size = 1;
+        writer.write_all(&buffer[..first_fragment_size]).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        writer.write_all(&buffer[first_fragment_size..n]).await?;
+    }
+    Ok(())
+}
+
+async fn send_fake_packets(addr: &str) -> Result<(), std::io::Error> {
+    let mut rng = thread_rng();
+    let fake_data: Vec<u8> = (0..100).map(|_| rng.gen()).collect();
+
+    let socket = TcpStream::connect(addr).await?;
+    socket.set_ttl(1)?;
+
+    let (mut reader, mut writer) = socket.into_split();
+
+    writer.write_all(&fake_data).await?;
+
+    let mut response = vec![0u8; 1024];
+    let _ = tokio::time::timeout(Duration::from_millis(100), reader.read(&mut response)).await;
+
+    Ok(())
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }

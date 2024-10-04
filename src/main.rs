@@ -4,7 +4,9 @@ use hyper::{
     Server,
 };
 use port_check::*;
-use proxer::{get_default_interface, handle_request, terminate_proxer, Proxy, ProxyConfig};
+use proxer::{
+    get_default_interface, handle_request, terminate_proxer, DpiBypassOptions, Proxy, ProxyConfig,
+};
 use signal_hook::consts::signal::*;
 use signal_hook_tokio::Signals;
 use std::sync::Arc;
@@ -14,7 +16,6 @@ use std::{fs, net::SocketAddr};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Close all proxer processes
     terminate_proxer();
-    println!("Test");
 
     // Read the config file
     let config_file = "proxer.json5";
@@ -65,12 +66,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a server and bind it to the socket address
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
+    let mut options = DpiBypassOptions::new();
+    options.tcp_fragmentation = false;
+    options.keep_alive_fragmentation = false;
+    options.replace_host_header = false;
+    options.remove_space_in_host_header = false;
+    // options.add_space_in_method = false;
+    options.mix_host_header_case = false;
+    options.send_fake_packets = false;
+    // options.enable_all();
+
+    let options = Arc::new(options);
+
     // Create a service builder to handle incoming connections
     let make_svc = make_service_fn(move |_conn| {
         let config = Arc::clone(&shared_config);
+        let options = Arc::clone(&options);
+
         async {
             Ok::<_, hyper::Error>(service_fn(move |req| {
-                handle_request(req, Arc::clone(&config))
+                handle_request(req, Arc::clone(&config), Arc::clone(&options))
             }))
         }
     });
