@@ -1,9 +1,17 @@
 use base64::{engine::general_purpose::STANDARD as b64, Engine as _};
 use chrono::Local;
+use clap::Parser;
 use hyper::{Body, Client, Method, Request, Response, StatusCode};
-use rand::{thread_rng, Rng};
+use rand::{rngs::StdRng, thread_rng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
-use std::{option, process::Command, string::FromUtf8Error, sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    option,
+    process::Command,
+    string::FromUtf8Error,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
@@ -11,6 +19,10 @@ use tokio::{
 };
 use tokio_native_tls::{native_tls, TlsConnector};
 use toml::from_str;
+use trust_dns_resolver::{
+    config::{ResolverConfig, ResolverOpts},
+    Resolver, TokioAsyncResolver,
+};
 use wildmatch::WildMatch;
 
 //
@@ -83,11 +95,36 @@ pub struct Proxy {
     pub port: u16,
 }
 
+#[derive(Parser, Debug, Clone)]
+#[clap(author, version, about, long_about = None)]
+pub struct Args {
+    /// Delay in milliseconds
+    #[clap(short, long, default_value_t = 1000)]
+    delay: u64,
+
+    /// DNS over HTTPS
+    #[clap(long)]
+    doh: bool,
+
+    /// DNS over TLS
+    #[clap(long)]
+    dot: bool,
+
+    /// Fragment size
+    #[clap(long)]
+    fragment_size: Option<i32>,
+
+    /// Size of the first fragment
+    #[clap(long, default_value_t = 1)]
+    first_fragment_size: usize,
+}
+
 // Handle HTTP and HTTPS requests
 pub async fn handle_request(
     req: Request<Body>,
     config: Arc<Vec<ProxyConfig>>,
     options: Arc<DpiBypassOptions>,
+    args: Args,
 ) -> Result<Response<Body>, hyper::Error> {
     let addr = req.uri().authority().unwrap().to_string();
     let time = formatted_time();
@@ -98,7 +135,7 @@ pub async fn handle_request(
             let options_clone = Arc::clone(&options);
 
             tokio::spawn(async move {
-                match tunnel(req, config_clone, options_clone).await {
+                match tunnel(req, config_clone, options_clone, &args).await {
                     Ok(_) => {}
                     Err(e) => {
                         eprintln!("\x1B[31m\x1B[1m[{time}] {} -> {}\x1B[0m", addr, e);
@@ -152,17 +189,21 @@ async fn tunnel(
     req: Request<Body>,
     config: Arc<Vec<ProxyConfig>>,
     options: Arc<DpiBypassOptions>,
+    args: &Args,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr = req.uri().authority().unwrap().to_string();
     let host = req.uri().host().unwrap();
+
+    let host_ip = resolve_host(host, &args).await?;
+    let resolve_addr = format!("{}:{}", host_ip, req.uri().port_u16().unwrap_or(80));
 
     let time = formatted_time();
 
     match find_matching_proxy(config.as_ref(), host) {
         Some(proxy) => {
             println!(
-                "\x1B[34m\x1B[1m[{time}] {} -> {} · {}\x1B[0m",
-                addr, proxy.name, proxy.scheme
+                "\x1B[34m\x1B[1m[{time}] {} ({}) -> {} · {}\x1B[0m",
+                addr, host_ip, proxy.name, proxy.scheme
             );
 
             let proxy_addr = format!("{}:{}", proxy.host, proxy.port);
@@ -174,13 +215,14 @@ async fn tunnel(
 
             match proxy.scheme.as_str() {
                 "HTTP" => {
-                    handle_http_proxy(req, tcp_stream, &addr, &proxy_user, &proxy_pass).await?;
+                    handle_http_proxy(req, tcp_stream, &resolve_addr, &proxy_user, &proxy_pass)
+                        .await?;
                 }
                 "HTTPS" => {
                     handle_https_proxy(
                         req,
                         tcp_stream,
-                        &addr,
+                        &resolve_addr,
                         &proxy.host,
                         &proxy_user,
                         &proxy_pass,
@@ -193,10 +235,11 @@ async fn tunnel(
             return Ok(());
         }
         None => {
-            println!("[{time}] {} -> Direct connection", addr);
+            println!("[{time}] {} ({}) -> Direct connection", addr, host_ip);
 
             // Connect to the server
-            let mut server = timeout(Duration::from_secs(10), TcpStream::connect(&addr)).await??;
+            let mut server =
+                timeout(Duration::from_secs(10), TcpStream::connect(&resolve_addr)).await??;
 
             // Get the upgraded connection from the client
             let upgraded = hyper::upgrade::on(req).await?;
@@ -240,30 +283,61 @@ async fn tunnel(
                 mix_host_header_case(&mut modified_buffer);
             }
 
-            // TCP-level fragmentation
-            if options.tcp_fragmentation {
-                let first_fragment_size = 1;
-                server
-                    .write_all(&modified_buffer[..first_fragment_size])
-                    .await?;
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                server
-                    .write_all(&modified_buffer[first_fragment_size..])
-                    .await?;
-            } else {
-                server.write_all(&modified_buffer).await?;
-            }
-
             // Отправка фейковых пакетов
             // if options.send_fake_packets {
-            //     send_fake_packets(&addr).await?;
+            //     // send_fake_packets(&addr, rng).await?;
+            //     add_fake_data(&mut modified_buffer);
+            // }
+
+            if let Some(fragment_size) = args.fragment_size {
+                println!("Set fragment_size");
+                // Разделяем пакет на мелкие фрагменты и отправляем их с задержками
+                let fragments = split_into_fragments(&modified_buffer, fragment_size);
+                for fragment in fragments {
+                    server.write_all(&fragment).await?;
+
+                    // Случайная задержка между фрагментами
+                    // let delay = thread_rng().gen_range(10..100);
+                    // tokio::time::sleep(Duration::from_millis(1)).await;
+
+                    // Отправка "мусорных" данных
+                    // if thread_rng().gen_bool(0.5) {
+                    //     let junk = generate_junk_data();
+                    //     server.write_all(&junk).await?;
+                    // }
+                }
+            } else {
+                println!("Set first_fragment_size");
+
+                // TCP-level fragmentation
+                if options.tcp_fragmentation {
+                    // let first_fragment_size = 1;
+                    let first_fragment_size = args.first_fragment_size;
+
+                    server
+                        .write_all(&modified_buffer[..first_fragment_size])
+                        .await?;
+                    tokio::time::sleep(Duration::from_millis(args.delay)).await;
+                    server
+                        .write_all(&modified_buffer[first_fragment_size..])
+                        .await?;
+                } else {
+                    server.write_all(&modified_buffer).await?;
+                }
+            }
+
+            //
+            // Отправка "мусорных" данных
+            // if thread_rng().gen_bool(0.5) {
+            //     let junk = generate_junk_data();
+            //     server.write_all(&junk).await?;
             // }
 
             // Send the first byte to the server
-            // server.write_all(&buffer[..1]).await?;
+            // server.write_all(&modified_buffer[..1]).await?;
 
             // Send the rest of the bytes to the server
-            // server.write_all(&buffer[1..bytes_read]).await?;
+            // server.write_all(&modified_buffer[1..]).await?;
 
             // Split the server connection into reader and writer
             let (mut server_reader, mut server_writer) = server.split();
@@ -556,9 +630,10 @@ where
     Ok(())
 }
 
-async fn send_fake_packets(addr: &str) -> Result<(), std::io::Error> {
-    let mut rng = thread_rng();
+async fn send_fake_packets(addr: &str, rng: &mut StdRng) -> Result<(), std::io::Error> {
+    // let mut rng = thread_rng();
     let fake_data: Vec<u8> = (0..100).map(|_| rng.gen()).collect();
+    println!("fake_data: {:?}", fake_data);
 
     let socket = TcpStream::connect(addr).await?;
     socket.set_ttl(1)?;
@@ -568,13 +643,92 @@ async fn send_fake_packets(addr: &str) -> Result<(), std::io::Error> {
     writer.write_all(&fake_data).await?;
 
     let mut response = vec![0u8; 1024];
-    let _ = tokio::time::timeout(Duration::from_millis(100), reader.read(&mut response)).await;
+    // let _ = tokio::time::timeout(Duration::from_millis(100), reader.read(&mut response)).await;
+    let resp = tokio::time::timeout(Duration::from_millis(100), reader.read(&mut response)).await;
+    println!("resp: {:?}", resp);
 
     Ok(())
+}
+
+fn add_fake_data(buffer: &mut Vec<u8>) {
+    let mut rng = rand::thread_rng();
+    let fake_data_length = rng.gen_range(10..=100);
+    let fake_data: Vec<u8> = (0..fake_data_length).map(|_| rng.gen()).collect();
+    buffer.extend_from_slice(&fake_data);
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+fn split_into_fragments(buffer: &[u8], fragment_size: i32) -> Vec<Vec<u8>> {
+    // let mut rng = thread_rng();
+    let mut fragments = Vec::new();
+    let mut start = 0;
+    while start < buffer.len() {
+        // let fragment_size = rng.gen_range(1..=100);
+        let end = (start + fragment_size as usize).min(buffer.len()); // 2
+        fragments.push(buffer[start..end].to_vec());
+        start = end;
+    }
+    // println!("fragments: {:?}", fragments);
+    fragments
+}
+
+fn generate_junk_data() -> Vec<u8> {
+    let mut rng = thread_rng();
+    let junk_size = rng.gen_range(1..=10);
+    (0..junk_size).map(|_| rng.gen()).collect()
+}
+
+// pub async fn resolve_host(host: &str) -> Result<IpAddr, std::io::Error> {
+//     // let resolver = Resolver::new(ResolverConfig::default(), ResolverOpts::default())?;
+//     // let lookup = resolver.lookup_ip(host).await?;
+
+//     // Construct a new Resolver with default configuration options
+//     let resolver = TokioAsyncResolver::tokio(
+//         ResolverConfig::cloudflare_tls(), // Use Cloudflare DNS
+//         ResolverOpts::default(),
+//     );
+
+//     // On Unix/Posix systems, this will read the /etc/resolv.conf
+//     // let  resolver = Resolver::from_system_conf().unwrap();
+
+//     // Lookup the IP addresses associated with a name.
+//     let response = resolver.lookup_ip(host).await?;
+//     let address = response.iter().next().expect("no addresses returned!");
+//     // println!("HOST: {}, IP: {}", host, address);
+
+//     // There can be many addresses associated with the name,
+//     //  this can return IPv4 and/or IPv6 addresses
+//     // let address = response.iter().next().expect("no addresses returned!");
+//     // if address.is_ipv4() {
+//     //     assert_eq!(address, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
+//     // } else {
+//     //     assert_eq!(
+//     //         address,
+//     //         IpAddr::V6(Ipv6Addr::new(
+//     //             0x2606, 0x2800, 0x220, 0x1, 0x248, 0x1893, 0x25c8, 0x1946
+//     //         ))
+//     //     );
+//     // }
+//     Ok(address)
+// }
+
+pub async fn resolve_host(host: &str, args: &Args) -> Result<IpAddr, std::io::Error> {
+    let resolver = if args.doh {
+        println!("Set DoH");
+        TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default())
+    } else if args.dot {
+        println!("Set DoT");
+        TokioAsyncResolver::tokio(ResolverConfig::cloudflare_tls(), ResolverOpts::default())
+    } else {
+        TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())
+    };
+
+    let response = resolver.lookup_ip(host).await?;
+    let address = response.iter().next().expect("no addresses returned!");
+    Ok(address)
 }

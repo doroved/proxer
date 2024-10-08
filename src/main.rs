@@ -1,3 +1,4 @@
+use clap::Parser;
 use futures::stream::StreamExt;
 use hyper::{
     service::{make_service_fn, service_fn},
@@ -5,7 +6,8 @@ use hyper::{
 };
 use port_check::*;
 use proxer::{
-    get_default_interface, handle_request, terminate_proxer, DpiBypassOptions, Proxy, ProxyConfig,
+    get_default_interface, handle_request, resolve_host, terminate_proxer, Args, DpiBypassOptions,
+    Proxy, ProxyConfig,
 };
 use signal_hook::consts::signal::*;
 use signal_hook_tokio::Signals;
@@ -14,14 +16,37 @@ use std::{fs, net::SocketAddr};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
     // Close all proxer processes
     terminate_proxer();
 
     // Read the config file
-    let config_file = "proxer.json5";
-    let config = fs::read_to_string(config_file).expect("Error reading config file");
+    // let config_file = "proxer.json5";
+    let config_str = r#"
+        [
+        {
+        name: "My dumbproxy [NL]",
+        enabled: false, // false to disable
+        scheme: "HTTPS", // HTTP, HTTPS
+        host: "proxy.example.com",
+        port: 8443,
+        auth_credentials: {
+          username: "admin",
+          password: "hello",
+        },
+          filter: [
+            {
+              name: "Test",
+              domains: ["2ip.io", "whoer.net", "*.facebook.com", "twitter.com"],
+            },
+          ],
+        },
+      ]
+        "#;
+    // let config = fs::read_to_string(config_file).expect("Error reading config file");
     let parsed_config: Vec<ProxyConfig> =
-        json5::from_str(&config).expect("Error parsing config file");
+        json5::from_str(&config_str).expect("Error parsing config file");
     let shared_config = Arc::new(parsed_config);
 
     // Get the default interface
@@ -67,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
     let mut options = DpiBypassOptions::new();
-    options.tcp_fragmentation = false;
+    options.tcp_fragmentation = true;
     options.keep_alive_fragmentation = false;
     options.replace_host_header = false;
     options.remove_space_in_host_header = false;
@@ -79,13 +104,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = Arc::new(options);
 
     // Create a service builder to handle incoming connections
+    // let make_svc = make_service_fn(move |_conn| {
+    //     let config = Arc::clone(&shared_config);
+    //     let options = Arc::clone(&options);
+
+    //     async {
+    //         Ok::<_, hyper::Error>(service_fn(move |req| {
+    //             handle_request(req, Arc::clone(&config), Arc::clone(&options))
+    //         }))
+    //     }
+    // });
+
+    // Create a service builder to handle incoming connections
     let make_svc = make_service_fn(move |_conn| {
         let config = Arc::clone(&shared_config);
         let options = Arc::clone(&options);
+        let args = args.clone();
 
-        async {
+        async move {
             Ok::<_, hyper::Error>(service_fn(move |req| {
-                handle_request(req, Arc::clone(&config), Arc::clone(&options))
+                let config = Arc::clone(&config);
+                let options = Arc::clone(&options);
+                let args = args.clone();
+                async move { handle_request(req, config, options, args).await }
             }))
         }
     });

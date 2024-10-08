@@ -28,6 +28,9 @@ wildmatch = "2.3.4"
 json5 = "0.4.1"
 chrono = "0.4.38"
 rand = { version = "0.8.5", features = ["std"] }
+trust-dns-resolver = { version = "0.23.2", features = ["dns-over-rustls"] }
+clap = { version = "4.5.19", features = ["derive"] }
+
 
 [profile.release]
 panic = "abort"   # Strip expensive panic clean-up logic
