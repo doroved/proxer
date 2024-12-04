@@ -1,5 +1,7 @@
 # Proxer
 
+> **Subscribe to us on [Telegram](https://t.me/macproxer) to receive notifications about new versions and updates.**
+
 Proxying TCP traffic on macOS with domain filtering via UI
 
 ![proxer screenshot](proxer.png)
@@ -26,7 +28,3 @@ In the future, releases will be signed with a certificate, and you will be able 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/doroved/proxer/main/install.sh | bash
 ```
-
-## Links
-
-[Proxer Channel TG](https://t.me/macproxer) - subscribe to not miss important updates.
