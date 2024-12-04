@@ -5,7 +5,7 @@ Proxying TCP traffic on macOS with domain filtering via UI
 ![proxer screenshot](proxer.png)
 
 > [!IMPORTANT]
-> Please note that the `proxer` repository has been renamed to [`proxer-cli`](https://github.com/doroved/proxer-ui) - this is the open-source version of the proxy client for command-line use.
+> Please note that the `proxer` repository has been renamed to [`proxer-cli`](https://github.com/doroved/proxer-cli) - this is the open-source version of the proxy client for command-line use.
 
 The current repository is intended for storing releases of the commercial version of Proxer as a UI program for macOS.
 
