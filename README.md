@@ -17,8 +17,6 @@ Subsequent development will implement all the functionality of `proxer-cli` + ne
 
 The payment model for using Proxer with both your proxies and ours is under development.
 
-Subscribe to our channel on [Telegram](https://t.me/macproxer) to receive information about the program and updates.
-
 ## Installation
 
 Currently, installation/update occurs by running `install.sh` from the command line.
