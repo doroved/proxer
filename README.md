@@ -26,3 +26,9 @@ In the future, releases will be signed with a certificate, and you will be able 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/doroved/proxer/main/install.sh | bash
 ```
+
+## How to run with logging enabled
+
+```bash
+/Applications/proxer.app/Contents/MacOS/proxer
+```
