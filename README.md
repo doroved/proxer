@@ -32,3 +32,17 @@ curl -fsSL https://raw.githubusercontent.com/doroved/proxer/main/install.sh | ba
 ```bash
 /Applications/proxer.app/Contents/MacOS/proxer
 ```
+
+## How to check the proxy server's functionality
+
+Run this command in the terminal, before that, make sure Proxer is running:
+
+```bash
+curl -I -v -x http://127.0.0.1:9999 https://www.youtube.com
+```
+
+If you receive a response with code `200`, everything is fine; if not, there is a problem with the connection to the proxy server. Please [message me](https://t.me/doroved) on Telegram, and I will try to resolve this issue.
+
+## I have `Ping > 0`, but YouTube is not working
+
+If you see `Ping > 0`, but YouTube is not opening, you need to disable `VPN/Proxy` service extensions in your browser.
